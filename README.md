@@ -33,7 +33,6 @@ Patches live under a per-kernel-version directory matching the upstream layout:
   snd-codecs-patches/
   amd-iommu-patches/
   clang-patches/
-  linux-tkg/                   vendored from Frogging-Family/linux-tkg
 ```
 
 The PKGBUILD fetches patches from
@@ -55,8 +54,5 @@ https://raw.githubusercontent.com/JPratama7/kernel-patches/main/${_major}/
 
 - Patch files are byte-identical to the archived upstream originals
   (sha256sums in the PKGBUILD match).
-- The vendored `linux-tkg/0012-misc-additions.patch` overlaps with
-  patches already in the set for 7.3; `patch -N` skips already-applied
-  hunks, so it is a no-op that must stay last in the apply order.
 - Local patches no longer used (e.g. xswap experiments) are kept out of
   this repo.
