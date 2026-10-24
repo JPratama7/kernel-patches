@@ -39,7 +39,7 @@ Patches live under a per-kernel-version directory matching the upstream layout:
 The PKGBUILD fetches patches from
 
 ```
-https://raw.githubusercontent.com/JPratama7/kernel-patches/master/${_major}/
+https://raw.githubusercontent.com/JPratama7/kernel-patches/main/${_major}/
 ```
 
 ## Adding a new kernel version
