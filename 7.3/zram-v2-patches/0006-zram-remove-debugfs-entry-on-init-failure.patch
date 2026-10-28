@@ -1,0 +1,26 @@
+From d8f019074989d5a6fbe0449edfd4372346f6e57e Mon Sep 17 00:00:00 2001
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Date: Sun, 25 Oct 2026 11:18:18 +0900
+Subject: [PATCH 06/19] zram: remove debugfs entry on init failure
+
+Do not leak the debugfs entry when zram_init() fails to register
+the block device.
+
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Reviewed-by: Barry Song <baohua@kernel.org>
+---
+ drivers/block/zram/zram_drv.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index ab064c84b..593fa4ae4 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -3297,6 +3297,7 @@ static int __init zram_init(void)
+ 	if (zram_major <= 0) {
+ 		pr_err("Unable to get major number\n");
+ 		class_unregister(&zram_control_class);
++		zram_debugfs_destroy();
+ 		cpuhp_remove_multi_state(CPUHP_ZCOMP_PREPARE);
+ 		return -EBUSY;
+ 	}
