@@ -15,6 +15,8 @@ Patches live under a per-kernel-version directory matching the upstream layout:
   arch-patches-sep/            Arch Linux patches
   bore-patches/                BORE scheduler
   lru-marie-patches/           LRU-MARIE
+  lru-marie-rc1-patches/       LRU-MARIE 1.0.0-rc1
+  lru-cast-patches/            CAST (self-tuning LRFU, Marie successor)
   poc-selector-patches/        POC scheduler selector
   amd-pstate-patches/
   cachyos-fixes-patches-v2-sep/
