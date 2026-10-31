@@ -54,6 +54,11 @@ https://raw.githubusercontent.com/JPratama7/kernel-patches/main/${_major}/
 
 ## Notes
 
+- `scripts/watch-sources.sh` checks the upstream sources (stable queue,
+  RT patchset, CachyOS, Seafoam-Labs, linux-tkg, regzbot) plus a patchwork
+  stability scan (fix-class patches for amdgpu/i915/xhci/io_uring) and marks
+  what's new since the last run. Run it before bumping `pkgver`; last-seen
+  state lives in `.watch/` (gitignored).
 - Patch files are byte-identical to the archived upstream originals
   (sha256sums in the PKGBUILD match).
 - Local patches no longer used (e.g. xswap experiments) are kept out of
