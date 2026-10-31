@@ -1,0 +1,279 @@
+diff --git a/include/linux/rseq_entry.h b/include/linux/rseq_entry.h
+index 31ce349ed42ce..23db2b3d81161 100644
+--- a/include/linux/rseq_entry.h
++++ b/include/linux/rseq_entry.h
+@@ -730,7 +730,10 @@ static __always_inline void rseq_syscall_exit_to_user_mode(void)
+ 
+ 	/* Needed to remove the store for the !lockdep case */
+ 	if (IS_ENABLED(CONFIG_LOCKDEP)) {
++#ifndef CONFIG_SCHED_ALT
++/* WA for sched/alt: [Sync] 9a723ed7facf sched/mmcid: Provide new scheduler CID mechanism */
+ 		WARN_ON_ONCE(ev->sched_switch);
++#endif /* !CONFIG_SCHED_ALT */
+ 		ev->events = 0;
+ 	}
+ }
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index d35ae49a991f7..f2534316c92f7 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -867,6 +867,7 @@ struct task_struct {
+ 	u8				__pad;
+ 
+ 	struct __call_single_node	wake_entry;
++#ifndef CONFIG_SCHED_ALT
+ 	unsigned int			wakee_flips;
+ 	unsigned long			wakee_flip_decay_ts;
+ 	struct task_struct		*last_wakee;
+@@ -880,12 +881,26 @@ struct task_struct {
+ 	 */
+ 	int				recent_used_cpu;
+ 	int				wake_cpu;
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	int				prio;
+ 	int				static_prio;
+ 	int				normal_prio;
+ 	unsigned int			rt_priority;
+ 
++#ifdef CONFIG_SCHED_ALT
++	u64				last_ran;
++	s64				time_slice;
++	struct list_head		sq_node;
++#ifdef CONFIG_SCHED_BMQ
++	int				boost_prio;
++#endif /* CONFIG_SCHED_BMQ */
++#ifdef CONFIG_SCHED_PDS
++	u64				deadline;
++#endif /* CONFIG_SCHED_PDS */
++	/* sched_clock time spent running */
++	u64				sched_time;
++#else /* !CONFIG_SCHED_ALT */
+ 	struct sched_entity		se;
+ 	struct sched_rt_entity		rt;
+ 	struct sched_dl_entity		dl;
+@@ -900,6 +915,7 @@ struct task_struct {
+ 	unsigned long			core_cookie;
+ 	unsigned int			core_occupation;
+ #endif
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ #ifdef CONFIG_CGROUP_SCHED
+ 	struct task_group		*sched_task_group;
+@@ -941,9 +957,13 @@ struct task_struct {
+ 	const cpumask_t			*cpus_ptr;
+ 	cpumask_t			*user_cpus_ptr;
+ 	cpumask_t			cpus_mask;
++#ifndef CONFIG_SCHED_ALT
+ 	void				*migration_pending;
++#endif
+ 	unsigned short			migration_disabled;
++#ifndef CONFIG_SCHED_ALT
+ 	unsigned short			migration_flags;
++#endif
+ 
+ #ifdef CONFIG_PREEMPT_RCU
+ 	int				rcu_read_lock_nesting;
+@@ -974,8 +994,10 @@ struct task_struct {
+ 	struct sched_info		sched_info;
+ 
+ 	struct list_head		tasks;
++#ifndef CONFIG_SCHED_ALT
+ 	struct plist_node		pushable_tasks;
+ 	struct rb_node			pushable_dl_tasks;
++#endif
+ 
+ 	struct mm_struct		*mm;
+ 	struct mm_struct		*active_mm;
+@@ -1703,6 +1725,15 @@ static inline bool sched_proxy_exec(void)
+ }
+ #endif
+ 
++#ifdef CONFIG_SCHED_ALT
++#define tsk_seruntime(t)		((t)->sched_time)
++/* replace the uncertian rt_timeout with 0UL */
++#define tsk_rttimeout(t)		(0UL)
++#else /* !CONFIG_SCHED_ALT: */
++#define tsk_seruntime(t)	((t)->se.sum_exec_runtime)
++#define tsk_rttimeout(t)	((t)->rt.timeout)
++#endif /* !CONFIG_SCHED_ALT */
++
+ #define TASK_REPORT_IDLE	(TASK_REPORT + 1)
+ #define TASK_REPORT_MAX		(TASK_REPORT_IDLE << 1)
+ 
+@@ -2301,7 +2332,11 @@ static inline void set_task_cpu(struct task_struct *p, unsigned int cpu)
+ 
+ static inline bool task_is_runnable(struct task_struct *p)
+ {
++#ifdef CONFIG_SCHED_ALT
++	return p->on_rq;
++#else
+ 	return p->on_rq && !p->se.sched_delayed;
++#endif /* !CONFIG_SCHED_ALT */
+ }
+ 
+ extern bool sched_task_on_rq(struct task_struct *p);
+@@ -2460,6 +2495,25 @@ DECLARE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
+ #endif
+ #define this_rq_pinned() (*(unsigned int *)((void *)this_rq_raw() + RQ_nr_pinned))
+ 
++static inline void
++__do_set_cpus_ptr(struct task_struct *p, const struct cpumask *new_mask)
++{
++	/*
++	 * This here violates the locking rules for affinity, since we're only
++	 * supposed to change these variables while holding both rq->lock and
++	 * p->pi_lock.
++	 *
++	 * HOWEVER, it magically works, because ttwu() is the only code that
++	 * accesses these variables under p->pi_lock and only does so after
++	 * smp_cond_load_acquire(&p->on_cpu, !VAL), and we're in __schedule()
++	 * before finish_task().
++	 *
++	 * XXX do further audits, this smells like something putrid.
++	 */
++	WARN_ON_ONCE(!p->on_cpu);
++	p->cpus_ptr = new_mask;
++}
++
+ static inline void __migrate_enable(void)
+ {
+ 	struct task_struct *p = current;
+@@ -2483,8 +2537,17 @@ static inline void __migrate_enable(void)
+ 	 * __set_cpus_allowed_ptr(SCA_MIGRATE_ENABLE) doesn't schedule().
+ 	 */
+ 	guard(preempt)();
++#ifdef CONFIG_SCHED_ALT
++	/*
++	 * Assumption: current should be running on allowed cpu
++	 */
++	WARN_ON_ONCE(!cpumask_test_cpu(smp_processor_id(), &p->cpus_mask));
++	if (p->cpus_ptr != &p->cpus_mask)
++		__do_set_cpus_ptr(p, &p->cpus_mask);
++#else
+ 	if (unlikely(p->cpus_ptr != &p->cpus_mask))
+ 		___migrate_enable();
++#endif
+ 	/*
+ 	 * Mustn't clear migration_disabled() until cpus_ptr points back at the
+ 	 * regular cpus_mask, otherwise things that race (eg.
+@@ -2511,8 +2574,20 @@ static inline void __migrate_disable(void)
+ 	}
+ 
+ 	guard(preempt)();
++#ifdef CONFIG_SCHED_ALT
++	int cpu = smp_processor_id();
++	if (cpumask_test_cpu(cpu, &p->cpus_mask)) {
++#endif
+ 	this_rq_pinned()++;
+ 	p->migration_disabled = 1;
++#ifdef CONFIG_SCHED_ALT
++		/*
++		 * Violates locking rules! see comment in __do_set_cpus_ptr().
++		 */
++		if (p->cpus_ptr == &p->cpus_mask)
++				__do_set_cpus_ptr(p, cpumask_of(cpu));
++	}
++#endif
+ }
+ #else /* !COMPILE_OFFSETS */
+ static inline void __migrate_disable(void) { }
+diff --git a/include/linux/sched/deadline.h b/include/linux/sched/deadline.h
+index 273538200a445..12b41502a6d40 100644
+--- a/include/linux/sched/deadline.h
++++ b/include/linux/sched/deadline.h
+@@ -2,6 +2,25 @@
+ #ifndef _LINUX_SCHED_DEADLINE_H
+ #define _LINUX_SCHED_DEADLINE_H
+ 
++#ifdef CONFIG_SCHED_ALT
++
++static inline int dl_task(struct task_struct *p)
++{
++	return 0;
++}
++
++#ifdef CONFIG_SCHED_BMQ
++#define __tsk_deadline(p)	(0UL)
++#endif
++
++#ifdef CONFIG_SCHED_PDS
++#define __tsk_deadline(p)	((((u64) ((p)->prio))<<56) | (p)->deadline)
++#endif
++
++#else
++
++#define __tsk_deadline(p)	((p)->dl.deadline)
++
+ /*
+  * SCHED_DEADLINE tasks has negative priorities, reflecting
+  * the fact that any of them has higher prio than RT and
+@@ -72,5 +91,6 @@ static inline bool dl_is_implicit(struct sched_dl_entity *dl_se)
+ {
+ 	return dl_se->dl_deadline == dl_se->dl_period;
+ }
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ #endif /* _LINUX_SCHED_DEADLINE_H */
+diff --git a/include/linux/sched/prio.h b/include/linux/sched/prio.h
+index 6ab43b4f72f9e..ef1cff556c5e6 100644
+--- a/include/linux/sched/prio.h
++++ b/include/linux/sched/prio.h
+@@ -19,6 +19,28 @@
+ #define MAX_PRIO		(MAX_RT_PRIO + NICE_WIDTH)
+ #define DEFAULT_PRIO		(MAX_RT_PRIO + NICE_WIDTH / 2)
+ 
++#ifdef CONFIG_SCHED_ALT
++
++/* Undefine MAX_PRIO and DEFAULT_PRIO */
++#undef MAX_PRIO
++#undef DEFAULT_PRIO
++
++/* +/- priority levels from the base priority */
++#ifdef CONFIG_SCHED_BMQ
++#define MAX_PRIORITY_ADJ	(12)
++#endif
++
++#ifdef CONFIG_SCHED_PDS
++#define MAX_PRIORITY_ADJ	(0)
++#endif
++
++#define MIN_NORMAL_PRIO		(128)
++#define NORMAL_PRIO_NUM		(64)
++#define MAX_PRIO		(MIN_NORMAL_PRIO + NORMAL_PRIO_NUM)
++#define DEFAULT_PRIO		(MAX_PRIO - MAX_PRIORITY_ADJ - NICE_WIDTH / 2)
++
++#endif /* CONFIG_SCHED_ALT */
++
+ /*
+  * Convert user-nice values [ -20 ... 0 ... 19 ]
+  * to static priority [ MAX_RT_PRIO..MAX_PRIO-1 ],
+diff --git a/include/linux/sched/rt.h b/include/linux/sched/rt.h
+index 922935cc33833..9cb5c02ef726f 100644
+--- a/include/linux/sched/rt.h
++++ b/include/linux/sched/rt.h
+@@ -45,8 +45,10 @@ static inline bool rt_or_dl_task_policy(struct task_struct *tsk)
+ 
+ 	if (policy == SCHED_FIFO || policy == SCHED_RR)
+ 		return true;
++#ifndef CONFIG_SCHED_ALT
+ 	if (policy == SCHED_DEADLINE)
+ 		return true;
++#endif
+ 	return false;
+ }
+ 
+diff --git a/include/linux/sched/topology.h b/include/linux/sched/topology.h
+index f96812d71c515..8984fce690230 100644
+--- a/include/linux/sched/topology.h
++++ b/include/linux/sched/topology.h
+@@ -226,7 +226,8 @@ extern void sched_update_asym_prefer_cpu(int cpu, int old_prio, int new_prio);
+ #define SDTL_INIT(maskfn, flagsfn, dname) ((struct sched_domain_topology_level) \
+ 	    { .mask = maskfn, .sd_flags = flagsfn, .name = #dname })
+ 
+-#if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
++#if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL) && \
++	!defined(CONFIG_SCHED_ALT)
+ extern void rebuild_sched_domains_energy(void);
+ #else
+ static inline void rebuild_sched_domains_energy(void)

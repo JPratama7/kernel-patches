@@ -1,0 +1,1070 @@
+diff --git a/kernel/sched/build_policy.c b/kernel/sched/build_policy.c
+index 2a828725a7f96..89f1fbf328f8b 100644
+--- a/kernel/sched/build_policy.c
++++ b/kernel/sched/build_policy.c
+@@ -49,13 +49,17 @@
+ 
+ #include "idle.c"
+ 
+-#include "rt.c"
+-#include "cpudeadline.c"
++#ifndef CONFIG_SCHED_ALT
++# include "rt.c"
++# include "cpudeadline.c"
++#endif
+ 
+ #include "pelt.c"
+ 
+ #include "cputime.c"
++#ifndef CONFIG_SCHED_ALT
+ #include "deadline.c"
++#endif
+ 
+ #ifdef CONFIG_SCHED_CLASS_EXT
+ # include <linux/btf_ids.h>
+diff --git a/kernel/sched/build_utility.c b/kernel/sched/build_utility.c
+index e2cf3b08d4e95..a64bf71a6c69a 100644
+--- a/kernel/sched/build_utility.c
++++ b/kernel/sched/build_utility.c
+@@ -56,6 +56,10 @@
+ 
+ #include "clock.c"
+ 
++#ifdef CONFIG_SCHED_ALT
++# include "alt_topology.c"
++#endif
++
+ #ifdef CONFIG_CGROUP_CPUACCT
+ # include "cpuacct.c"
+ #endif
+@@ -68,7 +72,7 @@
+ # include "cpufreq_schedutil.c"
+ #endif
+ 
+-#include "debug.c"
++# include "debug.c"
+ 
+ #ifdef CONFIG_SCHEDSTATS
+ # include "stats.c"
+@@ -81,7 +85,9 @@
+ #include "wait.c"
+ 
+ #include "cpupri.c"
+-#include "stop_task.c"
++#ifndef CONFIG_SCHED_ALT
++# include "stop_task.c"
++#endif
+ 
+ #include "topology.c"
+ 
+diff --git a/kernel/sched/cpufreq_schedutil.c b/kernel/sched/cpufreq_schedutil.c
+index 49ccd6f1c1850..7afcd522e9085 100644
+--- a/kernel/sched/cpufreq_schedutil.c
++++ b/kernel/sched/cpufreq_schedutil.c
+@@ -237,6 +237,7 @@ unsigned long sugov_effective_cpu_perf(int cpu, unsigned long actual,
+ 
+ static void sugov_get_util(struct sugov_cpu *sg_cpu, unsigned long boost)
+ {
++#ifndef CONFIG_SCHED_ALT
+ 	unsigned long min, max, util = scx_cpuperf_target(sg_cpu->cpu);
+ 
+ 	if (!scx_switched_all())
+@@ -246,6 +247,10 @@ static void sugov_get_util(struct sugov_cpu *sg_cpu, unsigned long boost)
+ 	sg_cpu->bw_min = min;
+ 	sg_cpu->bw_max = max;
+ 	sg_cpu->util = sugov_effective_cpu_perf(sg_cpu->cpu, util, min, max);
++#else /* CONFIG_SCHED_ALT */
++	sg_cpu->bw_min = 0;
++	sg_cpu->util = rq_load_util(cpu_rq(sg_cpu->cpu), arch_scale_cpu_capacity(sg_cpu->cpu));
++#endif /* CONFIG_SCHED_ALT */
+ }
+ 
+ /**
+@@ -373,6 +378,7 @@ static bool sugov_hold_freq(struct sugov_cpu *sg_cpu)
+ 	unsigned long idle_calls;
+ 	bool ret;
+ 
++#ifndef CONFIG_SCHED_ALT
+ 	/*
+ 	 * The heuristics in this function is for the fair class. For SCX, the
+ 	 * performance target comes directly from the BPF scheduler. Let's just
+@@ -380,6 +386,7 @@ static bool sugov_hold_freq(struct sugov_cpu *sg_cpu)
+ 	 */
+ 	if (scx_switched_all())
+ 		return false;
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	/* if capped by uclamp_max, always update to be in compliance */
+ 	if (uclamp_rq_is_capped(cpu_rq(sg_cpu->cpu)))
+@@ -405,8 +412,10 @@ static inline bool sugov_hold_freq(struct sugov_cpu *sg_cpu) { return false; }
+  */
+ static inline void ignore_dl_rate_limit(struct sugov_cpu *sg_cpu)
+ {
++#ifndef CONFIG_SCHED_ALT
+ 	if (cpu_bw_dl(cpu_rq(sg_cpu->cpu)) > sg_cpu->bw_min)
+-		sg_cpu->sg_policy->need_freq_update = true;
++		sg_cpu->sg_policy->limits_changed = true;
++#endif
+ }
+ 
+ static inline bool sugov_update_single_common(struct sugov_cpu *sg_cpu,
+@@ -702,6 +711,7 @@ static int sugov_kthread_create(struct sugov_policy *sg_policy)
+ 	}
+ 
+ 	ret = sched_setattr_nocheck(thread, &attr);
++
+ 	if (ret) {
+ 		kthread_stop(thread);
+ 		pr_warn("%s: failed to set SCHED_DEADLINE\n", __func__);
+diff --git a/kernel/sched/cputime.c b/kernel/sched/cputime.c
+index 06bddaa738e52..0bc9d146fd832 100644
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@ -130,7 +130,7 @@ void account_user_time(struct task_struct *p, u64 cputime)
+ 	p->utime += cputime;
+ 	account_group_user_time(p, cputime);
+ 
+-	index = (task_nice(p) > 0) ? CPUTIME_NICE : CPUTIME_USER;
++	index = task_running_nice(p) ? CPUTIME_NICE : CPUTIME_USER;
+ 
+ 	/* Add user time to cpustat. */
+ 	task_group_account_field(p, index, cputime);
+@@ -154,7 +154,7 @@ void account_guest_time(struct task_struct *p, u64 cputime)
+ 	p->gtime += cputime;
+ 
+ 	/* Add guest time to cpustat. */
+-	if (task_nice(p) > 0) {
++	if (task_running_nice(p)) {
+ 		task_group_account_field(p, CPUTIME_NICE, cputime);
+ 		cpustat[CPUTIME_GUEST_NICE] += cputime;
+ 	} else {
+@@ -305,7 +305,7 @@ static inline u64 account_other_time(u64 max)
+ #ifdef CONFIG_64BIT
+ static inline u64 read_sum_exec_runtime(struct task_struct *t)
+ {
+-	return t->se.sum_exec_runtime;
++	return tsk_seruntime(t);
+ }
+ #else /* !CONFIG_64BIT: */
+ static u64 read_sum_exec_runtime(struct task_struct *t)
+@@ -315,7 +315,7 @@ static u64 read_sum_exec_runtime(struct task_struct *t)
+ 	struct rq *rq;
+ 
+ 	rq = task_rq_lock(t, &rf);
+-	ns = t->se.sum_exec_runtime;
++	ns = tsk_seruntime(t);
+ 	task_rq_unlock(rq, t, &rf);
+ 
+ 	return ns;
+@@ -811,7 +811,7 @@ void cputime_adjust(struct task_cputime *curr, struct prev_cputime *prev,
+ void task_cputime_adjusted(struct task_struct *p, u64 *ut, u64 *st)
+ {
+ 	struct task_cputime cputime = {
+-		.sum_exec_runtime = p->se.sum_exec_runtime,
++		.sum_exec_runtime = tsk_seruntime(p),
+ 	};
+ 
+ 	if (task_cputime(p, &cputime.utime, &cputime.stime))
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 72236db67983b..70b7c3425509b 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -11,6 +11,7 @@
+ #include <linux/log2.h>
+ #include "sched.h"
+ 
++#ifndef CONFIG_SCHED_ALT
+ /*
+  * This allows printing both to /sys/kernel/debug/sched/debug and
+  * to the console
+@@ -251,6 +252,7 @@ static const struct file_operations sched_cache_enable_fops = {
+ 	.release        = single_release,
+ };
+ #endif
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ #ifdef CONFIG_PREEMPT_DYNAMIC
+ 
+@@ -318,6 +320,7 @@ static const struct file_operations sched_dynamic_fops = {
+ 
+ #endif /* CONFIG_PREEMPT_DYNAMIC */
+ 
++#ifndef CONFIG_SCHED_ALT
+ __read_mostly bool sched_debug_verbose;
+ 
+ static struct dentry           *sd_dentry;
+@@ -611,7 +614,11 @@ static const struct file_operations fair_server_period_fops = {
+ 	.llseek		= seq_lseek,
+ 	.release	= single_release,
+ };
++#endif /* !CONFIG_SCHED_ALT */
+ 
++static struct dentry *debugfs_sched;
++
++#ifndef CONFIG_SCHED_ALT
+ static void debugfs_fair_server_init(void)
+ {
+ 	struct dentry *d_fair;
+@@ -632,6 +639,7 @@ static void debugfs_fair_server_init(void)
+ 		debugfs_create_file("period", 0644, d_cpu, (void *) cpu, &fair_server_period_fops);
+ 	}
+ }
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ static int cgroup_mode = 2;
+@@ -715,14 +723,17 @@ static __init int sched_init_debug(void)
+ 
+ 	debugfs_sched = debugfs_create_dir("sched", NULL);
+ 
++#ifndef CONFIG_SCHED_ALT
+ 	debugfs_create_file("features", 0644, debugfs_sched, NULL, &sched_feat_fops);
+ 	debugfs_create_file_unsafe("verbose", 0644, debugfs_sched, &sched_debug_verbose, &sched_verbose_fops);
++#endif /* !CONFIG_SCHED_ALT */
+ #ifdef CONFIG_PREEMPT_DYNAMIC
+ 	debugfs_create_file("preempt", 0644, debugfs_sched, NULL, &sched_dynamic_fops);
+ #endif
+ 
+ 	debugfs_create_u32("base_slice_ns", 0644, debugfs_sched, &sysctl_sched_base_slice);
+ 
++#ifndef CONFIG_SCHED_ALT
+ 	debugfs_create_u32("latency_warn_ms", 0644, debugfs_sched, &sysctl_resched_latency_warn_ms);
+ 	debugfs_create_u32("latency_warn_once", 0644, debugfs_sched, &sysctl_resched_latency_warn_once);
+ 
+@@ -761,20 +772,25 @@ static __init int sched_init_debug(void)
+ #endif
+ 
+ 	debugfs_create_file("debug", 0444, debugfs_sched, NULL, &sched_debug_fops);
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	debugfs_create_file("cgroup_mode", 0644, debugfs_sched, NULL, &sched_cgroup_fops);
+ #endif
+ 
++#ifndef CONFIG_SCHED_ALT
+ 	debugfs_fair_server_init();
+ #ifdef CONFIG_SCHED_CLASS_EXT
+ 	debugfs_ext_server_init();
+ #endif
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	return 0;
+ }
+ late_initcall(sched_init_debug);
+ 
++#ifndef CONFIG_SCHED_ALT
++
+ static cpumask_var_t		sd_sysctl_cpus;
+ 
+ static int sd_flags_show(struct seq_file *m, void *v)
+@@ -1520,6 +1536,11 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
+ 
+ 	sched_show_numa(p, m);
+ }
++#else
++void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
++						  struct seq_file *m)
++{ }
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ void proc_sched_set_task(struct task_struct *p)
+ {
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index eb73b65ce6c47..c6a01e7453324 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -454,6 +454,7 @@ void cpu_startup_entry(enum cpuhp_state state)
+ 		do_idle();
+ }
+ 
++#ifndef CONFIG_SCHED_ALT
+ /*
+  * idle-task scheduling class.
+  */
+@@ -597,3 +598,4 @@ DEFINE_SCHED_CLASS(idle) = {
+ 	.switching_to		= switching_to_idle,
+ 	.update_curr		= update_curr_idle,
+ };
++#endif
+diff --git a/kernel/sched/pelt.c b/kernel/sched/pelt.c
+index 779eb58a42614..465753447be91 100644
+--- a/kernel/sched/pelt.c
++++ b/kernel/sched/pelt.c
+@@ -267,6 +267,7 @@ ___update_load_avg(struct sched_avg *sa, unsigned long load)
+ 	WRITE_ONCE(sa->util_avg, sa->util_sum / divider);
+ }
+ 
++#ifndef CONFIG_SCHED_ALT
+ /*
+  * sched_entity:
+  *
+@@ -384,8 +385,9 @@ int update_dl_rq_load_avg(u64 now, struct rq *rq, int running)
+ 
+ 	return 0;
+ }
++#endif
+ 
+-#ifdef CONFIG_SCHED_HW_PRESSURE
++#if defined(CONFIG_SCHED_HW_PRESSURE) && !defined(CONFIG_SCHED_ALT)
+ /*
+  * hardware:
+  *
+@@ -469,6 +471,7 @@ int update_irq_load_avg(struct rq *rq, u64 running)
+ }
+ #endif /* CONFIG_HAVE_SCHED_AVG_IRQ */
+ 
++#ifndef CONFIG_SCHED_ALT
+ /*
+  * Load avg and utiliztion metrics need to be updated periodically and before
+  * consumption. This function updates the metrics for all subsystems except for
+@@ -488,3 +491,4 @@ bool update_other_load_avgs(struct rq *rq)
+ 		update_hw_load_avg(rq_clock_task(rq), rq, hw_pressure) |
+ 		update_irq_load_avg(rq, 0);
+ }
++#endif /* !CONFIG_SCHED_ALT */
+diff --git a/kernel/sched/pelt.h b/kernel/sched/pelt.h
+index f921302dc40fb..2fade7dab9b01 100644
+--- a/kernel/sched/pelt.h
++++ b/kernel/sched/pelt.h
+@@ -5,14 +5,16 @@
+ 
+ #include "sched-pelt.h"
+ 
++#ifndef CONFIG_SCHED_ALT
+ int __update_load_avg_blocked_se(u64 now, struct sched_entity *se);
+ int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se);
+ int __update_load_avg_cfs_rq(u64 now, struct cfs_rq *cfs_rq);
+ int update_rt_rq_load_avg(u64 now, struct rq *rq, int running);
+ int update_dl_rq_load_avg(u64 now, struct rq *rq, int running);
+ bool update_other_load_avgs(struct rq *rq);
++#endif
+ 
+-#ifdef CONFIG_SCHED_HW_PRESSURE
++#if defined(CONFIG_SCHED_HW_PRESSURE) && !defined(CONFIG_SCHED_ALT)
+ int update_hw_load_avg(u64 now, struct rq *rq, u64 capacity);
+ 
+ static inline u64 hw_load_avg(struct rq *rq)
+@@ -49,6 +51,7 @@ static inline u32 get_pelt_divider(struct sched_avg *avg)
+ 	return PELT_MIN_DIVIDER + avg->period_contrib;
+ }
+ 
++#ifndef CONFIG_SCHED_ALT
+ static inline void cfs_se_util_change(struct sched_avg *avg)
+ {
+ 	unsigned int enqueued;
+@@ -185,5 +188,6 @@ static inline u64 cfs_rq_clock_pelt(struct cfs_rq *cfs_rq)
+ 	return rq_clock_pelt(rq_of(cfs_rq));
+ }
+ #endif /* !CONFIG_CFS_BANDWIDTH */
++#endif /* CONFIG_SCHED_ALT */
+ 
+ #endif /* _KERNEL_SCHED_PELT_H */
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 4c25fbe84fb54..d2f52d1f0b3e6 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -5,6 +5,10 @@
+ #ifndef _KERNEL_SCHED_SCHED_H
+ #define _KERNEL_SCHED_SCHED_H
+ 
++#ifdef CONFIG_SCHED_ALT
++#include "alt_sched.h"
++#else
++
+ #include <linux/prandom.h>
+ #include <linux/sched/affinity.h>
+ #include <linux/sched/autogroup.h>
+@@ -4252,4 +4256,9 @@ DEFINE_CLASS_IS_UNCONDITIONAL(sched_change)
+ 
+ #include "ext/ext.h"
+ 
++static inline int task_running_nice(struct task_struct *p)
++{
++	return (task_nice(p) > 0);
++}
++#endif /* !CONFIG_SCHED_ALT */
+ #endif /* _KERNEL_SCHED_SCHED_H */
+diff --git a/kernel/sched/stats.c b/kernel/sched/stats.c
+index d1c9429a4ac5a..cc3764073dd34 100644
+--- a/kernel/sched/stats.c
++++ b/kernel/sched/stats.c
+@@ -115,8 +115,10 @@ static int show_schedstat(struct seq_file *seq, void *v)
+ 		seq_printf(seq, "timestamp %lu\n", jiffies);
+ 	} else {
+ 		struct rq *rq;
++#ifndef CONFIG_SCHED_ALT
+ 		struct sched_domain *sd;
+ 		int dcount = 0;
++#endif
+ 		cpu = (unsigned long)(v - 2);
+ 		rq = cpu_rq(cpu);
+ 
+@@ -131,6 +133,7 @@ static int show_schedstat(struct seq_file *seq, void *v)
+ 
+ 		seq_printf(seq, "\n");
+ 
++#ifndef CONFIG_SCHED_ALT
+ 		/* domain-specific stats */
+ 		rcu_read_lock();
+ 		for_each_domain(cpu, sd) {
+@@ -161,6 +164,7 @@ static int show_schedstat(struct seq_file *seq, void *v)
+ 			    sd->ttwu_move_balance);
+ 		}
+ 		rcu_read_unlock();
++#endif
+ 	}
+ 	return 0;
+ }
+diff --git a/kernel/sched/stats.h b/kernel/sched/stats.h
+index ebe0a7765f98e..90a7947c6b483 100644
+--- a/kernel/sched/stats.h
++++ b/kernel/sched/stats.h
+@@ -89,6 +89,7 @@ static inline void rq_sched_info_depart  (struct rq *rq, unsigned long long delt
+ 
+ #endif /* CONFIG_SCHEDSTATS */
+ 
++#ifndef CONFIG_SCHED_ALT
+ static inline struct sched_statistics *
+ __schedstats_from_se(struct sched_entity *se)
+ {
+@@ -98,6 +99,7 @@ __schedstats_from_se(struct sched_entity *se)
+ #endif
+ 	return &task_of(se)->stats;
+ }
++#endif /* CONFIG_SCHED_ALT */
+ 
+ #ifdef CONFIG_PSI
+ void psi_task_change(struct task_struct *task, int clear, int set);
+diff --git a/kernel/sched/syscalls.c b/kernel/sched/syscalls.c
+index b215b0ead9a60..1e736f2b0a776 100644
+--- a/kernel/sched/syscalls.c
++++ b/kernel/sched/syscalls.c
+@@ -16,6 +16,14 @@
+ #include "sched.h"
+ #include "autogroup.h"
+ 
++#ifdef CONFIG_SCHED_ALT
++#include "alt_core.h"
++
++static inline int __normal_prio(int policy, int rt_prio, int static_prio)
++{
++	return rt_policy(policy) ? (MAX_RT_PRIO - 1 - rt_prio) : static_prio;
++}
++#else /* !CONFIG_SCHED_ALT */
+ static inline int __normal_prio(int policy, int rt_prio, int nice)
+ {
+ 	int prio;
+@@ -29,6 +37,7 @@ static inline int __normal_prio(int policy, int rt_prio, int nice)
+ 
+ 	return prio;
+ }
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ /*
+  * Calculate the expected normal priority: i.e. priority
+@@ -39,7 +48,11 @@ static inline int __normal_prio(int policy, int rt_prio, int nice)
+  */
+ static inline int normal_prio(struct task_struct *p)
+ {
++#ifdef CONFIG_SCHED_ALT
++	return __normal_prio(p->policy, p->rt_priority, p->static_prio);
++#else /* !CONFIG_SCHED_ALT */
+ 	return __normal_prio(p->policy, p->rt_priority, PRIO_TO_NICE(p->static_prio));
++#endif /* !CONFIG_SCHED_ALT */
+ }
+ 
+ /*
+@@ -64,7 +77,9 @@ static int effective_prio(struct task_struct *p)
+ 
+ void set_user_nice(struct task_struct *p, long nice)
+ {
++#ifndef CONFIG_SCHED_ALT
+ 	int old_prio;
++#endif
+ 
+ 	if (task_nice(p) == nice || nice < MIN_NICE || nice > MAX_NICE)
+ 		return;
+@@ -72,7 +87,11 @@ void set_user_nice(struct task_struct *p, long nice)
+ 	 * We have to be careful, if called from sys_setpriority(),
+ 	 * the task might be in the middle of scheduling on another CPU.
+ 	 */
++#ifdef CONFIG_SCHED_ALT
++	guard(task_access_lock)(p);
++#else
+ 	guard(task_rq_lock)(p);
++#endif
+ 
+ 	/*
+ 	 * The RT priorities are set via sched_setscheduler(), but we still
+@@ -87,8 +106,10 @@ void set_user_nice(struct task_struct *p, long nice)
+ 
+ 	scoped_guard (sched_change, p, DEQUEUE_SAVE) {
+ 		p->static_prio = NICE_TO_PRIO(nice);
++#ifndef CONFIG_SCHED_ALT
+ 		set_load_weight(p, true);
+ 		old_prio = p->prio;
++#endif
+ 		p->prio = effective_prio(p);
+ 	}
+ }
+@@ -169,7 +190,19 @@ SYSCALL_DEFINE1(nice, int, increment)
+  */
+ int task_prio(const struct task_struct *p)
+ {
++#ifdef CONFIG_SCHED_ALT
++/*
++ * sched policy         return value   kernel prio    user prio/nice
++ *
++ * (BMQ)normal, batch, idle[0 ... 53]  [100 ... 139]          0/[-20 ... 19]/[-7 ... 7]
++ * (PDS)normal, batch, idle[0 ... 39]            100          0/[-20 ... 19]
++ * fifo, rr             [-1 ... -100]     [99 ... 0]  [0 ... 99]
++ */
++	return (p->prio < MAX_RT_PRIO) ? p->prio - MAX_RT_PRIO :
++		task_sched_prio_normal(p, task_rq(p));
++#else
+ 	return p->prio - MAX_RT_PRIO;
++#endif /* !CONFIG_SCHED_ALT */
+ }
+ 
+ /**
+@@ -248,11 +281,16 @@ static void __setscheduler_params(struct task_struct *p,
+ 
+ 	p->policy = policy;
+ 
++#ifndef CONFIG_SCHED_ALT
+ 	if (dl_policy(policy))
+ 		__setparam_dl(p, attr);
+ 	else if (fair_policy(policy))
+ 		__setparam_fair(p, attr);
++#else	/* !CONFIG_SCHED_ALT */
++	p->static_prio = NICE_TO_PRIO(attr->sched_nice);
++#endif /* CONFIG_SCHED_ALT */
+ 
++#ifndef CONFIG_SCHED_ALT
+ 	/* rt-policy tasks do not have a timerslack */
+ 	if (rt_or_dl_task_policy(p)) {
+ 		p->timer_slack_ns = 0;
+@@ -260,6 +298,7 @@ static void __setscheduler_params(struct task_struct *p,
+ 		/* when switching back to non-rt policy, restore timerslack */
+ 		p->timer_slack_ns = p->default_timer_slack_ns;
+ 	}
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	/*
+ 	 * __sched_setscheduler() ensures attr->sched_priority == 0 when
+@@ -268,7 +307,9 @@ static void __setscheduler_params(struct task_struct *p,
+ 	 */
+ 	p->rt_priority = attr->sched_priority;
+ 	p->normal_prio = normal_prio(p);
++#ifndef CONFIG_SCHED_ALT
+ 	set_load_weight(p, true);
++#endif /* !CONFIG_SCHED_ALT */
+ }
+ 
+ /*
+@@ -284,7 +325,7 @@ static bool check_same_owner(struct task_struct *p)
+ 		uid_eq(cred->euid, pcred->uid));
+ }
+ 
+-#ifdef CONFIG_RT_MUTEXES
++#if defined(CONFIG_RT_MUTEXES) && !defined(CONFIG_SCHED_ALT)
+ static inline void __setscheduler_dl_pi(int newprio, int policy,
+ 			      struct task_struct *p,
+ 			      struct sched_change_ctx *scope)
+@@ -313,6 +354,7 @@ static inline void __setscheduler_dl_pi(int newprio, int policy,
+ }
+ #endif /* !CONFIG_RT_MUTEXES */
+ 
++#ifndef CONFIG_SCHED_ALT
+ #ifdef CONFIG_UCLAMP_TASK
+ 
+ static int uclamp_validate(struct task_struct *p,
+@@ -426,6 +468,7 @@ static inline int uclamp_validate(struct task_struct *p,
+ static void __setscheduler_uclamp(struct task_struct *p,
+ 				  const struct sched_attr *attr) { }
+ #endif /* !CONFIG_UCLAMP_TASK */
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ /*
+  * Allow unprivileged RT tasks to decrease priority.
+@@ -436,11 +479,13 @@ static int user_check_sched_setscheduler(struct task_struct *p,
+ 					 const struct sched_attr *attr,
+ 					 int policy, int reset_on_fork)
+ {
++#ifndef CONFIG_SCHED_ALT
+ 	if (fair_policy(policy)) {
+ 		if (attr->sched_nice < task_nice(p) &&
+ 		    !is_nice_reduction(p, attr->sched_nice))
+ 			goto req_priv;
+ 	}
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	if (rt_policy(policy)) {
+ 		unsigned long rlim_rtprio = task_rlimit(p, RLIMIT_RTPRIO);
+@@ -455,6 +500,7 @@ static int user_check_sched_setscheduler(struct task_struct *p,
+ 			goto req_priv;
+ 	}
+ 
++#ifndef CONFIG_SCHED_ALT
+ 	/*
+ 	 * Can't set/change SCHED_DEADLINE policy at all for now
+ 	 * (safest behavior); in the future we would like to allow
+@@ -472,6 +518,7 @@ static int user_check_sched_setscheduler(struct task_struct *p,
+ 		if (!is_nice_reduction(p, task_nice(p)))
+ 			goto req_priv;
+ 	}
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	/* Can't change other user's priorities: */
+ 	if (!check_same_owner(p))
+@@ -491,12 +538,22 @@ static int user_check_sched_setscheduler(struct task_struct *p,
+ }
+ 
+ int __sched_setscheduler(struct task_struct *p,
+-			 const struct sched_attr *attr,
+-			 bool user, bool pi)
++			const struct sched_attr *attr,
++			bool user, bool pi)
+ {
++#ifdef CONFIG_SCHED_ALT
++	const struct sched_attr dl_squash_attr = {
++		.size		= sizeof(struct sched_attr),
++		.sched_policy	= SCHED_FIFO,
++		.sched_nice	= 0,
++		.sched_priority = 99,
++	};
++#endif /* CONFIG_SCHED_ALT */
+ 	int oldpolicy = -1, policy = attr->sched_policy;
+ 	int retval, oldprio, newprio;
++#ifndef CONFIG_SCHED_ALT
+ 	const struct sched_class *prev_class, *next_class;
++#endif /* !CONFIG_SCHED_ALT */
+ 	struct balance_callback *head;
+ 	struct rq_flags rf;
+ 	int reset_on_fork;
+@@ -506,6 +563,15 @@ int __sched_setscheduler(struct task_struct *p,
+ 
+ 	/* The pi code expects interrupts enabled */
+ 	BUG_ON(pi && in_interrupt());
++#ifdef CONFIG_SCHED_ALT
++	/*
++	 * Alt schedule FW supports SCHED_DEADLINE by squash it as prio 0 SCHED_FIFO
++	 */
++	if (unlikely(SCHED_DEADLINE == policy)) {
++		attr = &dl_squash_attr;
++		policy = attr->sched_policy;
++	}
++#endif /* CONFIG_SCHED_ALT */
+ recheck:
+ 	/* Double check policy once rq lock held: */
+ 	if (policy < 0) {
+@@ -528,8 +594,12 @@ int __sched_setscheduler(struct task_struct *p,
+ 	 */
+ 	if (attr->sched_priority > MAX_RT_PRIO-1)
+ 		return -EINVAL;
++#ifdef CONFIG_SCHED_ALT
++	if ((rt_policy(policy) != (attr->sched_priority != 0)))
++#else
+ 	if ((dl_policy(policy) && !__checkparam_dl(attr)) ||
+ 	    (rt_policy(policy) != (attr->sched_priority != 0)))
++#endif /* !CONFIG_SCHED_ALT */
+ 		return -EINVAL;
+ 
+ 	if (user) {
+@@ -545,6 +615,7 @@ int __sched_setscheduler(struct task_struct *p,
+ 			return retval;
+ 	}
+ 
++#ifndef CONFIG_SCHED_ALT
+ 	/* Update task specific "requested" clamps */
+ 	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP) {
+ 		retval = uclamp_validate(p, attr);
+@@ -560,6 +631,7 @@ int __sched_setscheduler(struct task_struct *p,
+ 		cpuset_locked = true;
+ 		cpuset_lock();
+ 	}
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	/*
+ 	 * Make sure no PI-waiters arrive (or leave) while we are
+@@ -568,8 +640,12 @@ int __sched_setscheduler(struct task_struct *p,
+ 	 * To be able to change p->policy safely, the appropriate
+ 	 * runqueue lock must be held.
+ 	 */
++#ifdef CONFIG_SCHED_ALT
++	rq = task_access_lock(p, &rf);
++#else
+ 	rq = task_rq_lock(p, &rf);
+ 	update_rq_clock(rq);
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	/*
+ 	 * Changing the policy of the stop threads its a very bad idea:
+@@ -579,23 +655,31 @@ int __sched_setscheduler(struct task_struct *p,
+ 		goto unlock;
+ 	}
+ 
++#ifndef CONFIG_SCHED_ALT
+ 	retval = scx_check_setscheduler(p, policy);
+ 	if (retval)
+ 		goto unlock;
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	/*
+ 	 * If not changing anything there's no need to proceed further,
+ 	 * but store a possible modification of reset_on_fork.
+ 	 */
+ 	if (unlikely(policy == p->policy)) {
++#ifdef CONFIG_SCHED_ALT
++		if (!rt_policy(policy) && NICE_TO_PRIO(attr->sched_nice) != p->static_prio)
++#else
+ 		if (fair_policy(policy) &&
+ 		    (attr->sched_nice != task_nice(p) ||
+ 		     (attr->sched_runtime != p->se.slice)))
++#endif /* !CONFIG_SCHED_ALT */
+ 			goto change;
+ 		if (rt_policy(policy) && attr->sched_priority != p->rt_priority)
+ 			goto change;
++#ifndef CONFIG_SCHED_ALT
+ 		if (dl_policy(policy) && dl_param_changed(p, attr))
+ 			goto change;
++#endif /* !CONFIG_SCHED_ALT */
+ 		if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP)
+ 			goto change;
+ 
+@@ -605,6 +689,7 @@ int __sched_setscheduler(struct task_struct *p,
+ 	}
+ change:
+ 
++#ifndef CONFIG_SCHED_ALT
+ 	if (user) {
+ #ifdef CONFIG_RT_GROUP_SCHED
+ 		/*
+@@ -635,16 +720,22 @@ int __sched_setscheduler(struct task_struct *p,
+ 			}
+ 		}
+ 	}
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	/* Re-check policy now with rq lock held: */
+ 	if (unlikely(oldpolicy != -1 && oldpolicy != p->policy)) {
+ 		policy = oldpolicy = -1;
++#ifdef CONFIG_SCHED_ALT
++		task_access_unlock(p, &rf);
++#else
+ 		task_rq_unlock(rq, p, &rf);
++#endif /* !CONFIG_SCHED_ALT */
+ 		if (cpuset_locked)
+ 			cpuset_unlock();
+ 		goto recheck;
+ 	}
+ 
++#ifndef CONFIG_SCHED_ALT
+ 	/*
+ 	 * If setscheduling to SCHED_DEADLINE (or changing the parameters
+ 	 * of a SCHED_DEADLINE task) we need to check if enough bandwidth
+@@ -654,11 +745,16 @@ int __sched_setscheduler(struct task_struct *p,
+ 		retval = -EBUSY;
+ 		goto unlock;
+ 	}
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	p->sched_reset_on_fork = reset_on_fork;
+ 	oldprio = p->prio;
+ 
++#ifdef CONFIG_SCHED_ALT
++	newprio = __normal_prio(policy, attr->sched_priority, NICE_TO_PRIO(attr->sched_nice));
++#else
+ 	newprio = __normal_prio(policy, attr->sched_priority, attr->sched_nice);
++#endif /* !CONFIG_SCHED_ALT */
+ 	if (pi) {
+ 		/*
+ 		 * Take priority boosted tasks into account. If the new
+@@ -672,21 +768,27 @@ int __sched_setscheduler(struct task_struct *p,
+ 			queue_flags &= ~DEQUEUE_MOVE;
+ 	}
+ 
++#ifndef CONFIG_SCHED_ALT
+ 	prev_class = p->sched_class;
+ 	next_class = __setscheduler_class(policy, newprio);
+ 
+ 	if (prev_class != next_class)
+ 		queue_flags |= DEQUEUE_CLASS;
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	scoped_guard (sched_change, p, queue_flags) {
+ 
+ 		if (!(attr->sched_flags & SCHED_FLAG_KEEP_PARAMS)) {
+ 			__setscheduler_params(p, attr);
++#ifndef CONFIG_SCHED_ALT
+ 			p->sched_class = next_class;
++#endif /* !CONFIG_SCHED_ALT */
+ 			p->prio = newprio;
+ 			__setscheduler_dl_pi(newprio, policy, p, scope);
+ 		}
++#ifndef CONFIG_SCHED_ALT
+ 		__setscheduler_uclamp(p, attr);
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 		if (scope->queued) {
+ 			/*
+@@ -701,7 +803,11 @@ int __sched_setscheduler(struct task_struct *p,
+ 	/* Avoid rq from going away on us: */
+ 	preempt_disable();
+ 	head = splice_balance_callbacks(rq);
++#ifdef CONFIG_SCHED_ALT
++	task_access_unlock(p, &rf);
++#else
+ 	task_rq_unlock(rq, p, &rf);
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	if (pi) {
+ 		if (cpuset_locked)
+@@ -716,7 +822,11 @@ int __sched_setscheduler(struct task_struct *p,
+ 	return 0;
+ 
+ unlock:
++#ifdef CONFIG_SCHED_ALT
++	task_access_unlock(p, &rf);
++#else
+ 	task_rq_unlock(rq, p, &rf);
++#endif /* !CONFIG_SCHED_ALT */
+ 	if (cpuset_locked)
+ 		cpuset_unlock();
+ 	return retval;
+@@ -731,8 +841,10 @@ static int _sched_setscheduler(struct task_struct *p, int policy,
+ 		.sched_nice	= PRIO_TO_NICE(p->static_prio),
+ 	};
+ 
++#ifndef CONFIG_SCHED_ALT
+ 	if (p->se.custom_slice)
+ 		attr.sched_runtime = p->se.slice;
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	/* Fixup the legacy SCHED_RESET_ON_FORK hack. */
+ 	if ((policy != SETPARAM_POLICY) && (policy & SCHED_RESET_ON_FORK)) {
+@@ -913,13 +1025,18 @@ static int sched_copy_attr(struct sched_attr __user *uattr, struct sched_attr *a
+ 
+ static void get_params(struct task_struct *p, struct sched_attr *attr, unsigned int flags)
+ {
++#ifndef CONFIG_SCHED_ALT
+ 	if (task_has_dl_policy(p)) {
+ 		__getparam_dl(p, attr, flags);
+-	} else if (task_has_rt_policy(p)) {
++	} else
++#endif
++	if (task_has_rt_policy(p)) {
+ 		attr->sched_priority = p->rt_priority;
+ 	} else {
+ 		attr->sched_nice = task_nice(p);
++#ifndef CONFIG_SCHED_ALT
+ 		attr->sched_runtime = p->se.slice;
++#endif
+ 	}
+ }
+ 
+@@ -1106,6 +1223,7 @@ SYSCALL_DEFINE4(sched_getattr, pid_t, pid, struct sched_attr __user *, uattr,
+ 
+ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
+ {
++#ifndef CONFIG_SCHED_ALT
+ 	/*
+ 	 * If the task isn't a deadline task or admission control is
+ 	 * disabled then we don't care about affinity changes.
+@@ -1129,6 +1247,7 @@ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
+ 	guard(rcu)();
+ 	if (!cpumask_subset(task_rq(p)->rd->span, mask))
+ 		return -EBUSY;
++#endif
+ 
+ 	return 0;
+ }
+@@ -1152,9 +1271,11 @@ int __sched_setaffinity(struct task_struct *p, struct affinity_context *ctx)
+ 	ctx->new_mask = new_mask;
+ 	ctx->flags |= SCA_CHECK;
+ 
++#ifndef CONFIG_SCHED_ALT
+ 	retval = dl_task_check_affinity(p, new_mask);
+ 	if (retval)
+ 		goto out_free_new_mask;
++#endif
+ 
+ 	retval = __set_cpus_allowed_ptr(p, ctx);
+ 	if (retval)
+@@ -1334,13 +1455,34 @@ SYSCALL_DEFINE3(sched_getaffinity, pid_t, pid, unsigned int, len,
+ 
+ static void do_sched_yield(void)
+ {
+-	struct rq_flags rf;
+ 	struct rq *rq;
++	struct rq_flags rf;
++
++#ifdef CONFIG_SCHED_ALT
++	struct task_struct *p;
++
++	if (!sched_yield_type)
++		return;
++
++	rq = this_rq_lock_irq(&rf);
++
++	schedstat_inc(rq->yld_count);
+ 
++	p = current;
++	if (rt_task(p)) {
++		if (task_on_rq_queued(p))
++			requeue_task(p, rq);
++	} else if (rq->nr_running > 1) {
++		do_sched_yield_type_1(p, rq);
++		if (task_on_rq_queued(p))
++			requeue_task(p, rq);
++	}
++#else /* !CONFIG_SCHED_ALT */
+ 	rq = this_rq_lock_irq(&rf);
+ 
+ 	schedstat_inc(rq->yld_count);
+ 	rq->donor->sched_class->yield_task(rq);
++#endif /* !CONFIG_SCHED_ALT */
+ 
+ 	preempt_disable();
+ 	rq_unlock_irq(rq, &rf);
+@@ -1409,6 +1551,9 @@ EXPORT_SYMBOL(yield);
+  */
+ int __sched yield_to(struct task_struct *p, bool preempt)
+ {
++#ifdef CONFIG_SCHED_ALT
++	return 0;
++#else /* !CONFIG_SCHED_ALT */
+ 	struct task_struct *curr;
+ 	struct rq *rq, *p_rq;
+ 	int yielded = 0;
+@@ -1455,6 +1600,7 @@ int __sched yield_to(struct task_struct *p, bool preempt)
+ 		schedule();
+ 
+ 	return yielded;
++#endif /* !CONFIG_SCHED_ALT */
+ }
+ EXPORT_SYMBOL_GPL(yield_to);
+ 
+@@ -1475,7 +1621,9 @@ SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
+ 	case SCHED_RR:
+ 		ret = MAX_RT_PRIO-1;
+ 		break;
++#ifndef CONFIG_SCHED_ALT
+ 	case SCHED_DEADLINE:
++#endif
+ 	case SCHED_NORMAL:
+ 	case SCHED_BATCH:
+ 	case SCHED_IDLE:
+@@ -1503,7 +1651,9 @@ SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
+ 	case SCHED_RR:
+ 		ret = 1;
+ 		break;
++#ifndef CONFIG_SCHED_ALT
+ 	case SCHED_DEADLINE:
++#endif
+ 	case SCHED_NORMAL:
+ 	case SCHED_BATCH:
+ 	case SCHED_IDLE:
+@@ -1515,7 +1665,9 @@ SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
+ 
+ static int sched_rr_get_interval(pid_t pid, struct timespec64 *t)
+ {
++#ifndef CONFIG_SCHED_ALT
+ 	unsigned int time_slice = 0;
++#endif
+ 	int retval;
+ 
+ 	if (pid < 0)
+@@ -1530,6 +1682,7 @@ static int sched_rr_get_interval(pid_t pid, struct timespec64 *t)
+ 		if (retval)
+ 			return retval;
+ 
++#ifndef CONFIG_SCHED_ALT
+ 		scoped_guard (task_rq_lock, p) {
+ 			struct rq *rq = scope.rq;
+ 			if (p->sched_class->get_rr_interval)
+@@ -1538,6 +1691,13 @@ static int sched_rr_get_interval(pid_t pid, struct timespec64 *t)
+ 	}
+ 
+ 	jiffies_to_timespec64(time_slice, t);
++#else
++	}
++
++	alt_sched_debug();
++
++	*t = ns_to_timespec64(sysctl_sched_base_slice);
++#endif /* !CONFIG_SCHED_ALT */
+ 	return 0;
+ }
+ 
+diff --git a/kernel/sched/topology.c b/kernel/sched/topology.c
+index 3dab0253976fb..4a3b08e2db355 100644
+--- a/kernel/sched/topology.c
++++ b/kernel/sched/topology.c
+@@ -3,6 +3,7 @@
+  * Scheduler topology setup/handling methods
+  */
+ 
++#ifndef CONFIG_SCHED_ALT
+ #include <linux/sched/isolation.h>
+ #include <linux/sched/clock.h>
+ #include <linux/bsearch.h>
+@@ -1790,8 +1791,10 @@ static void asym_cpu_capacity_scan(void)
+  */
+ 
+ static int default_relax_domain_level = -1;
++#endif /* CONFIG_SCHED_ALT */
+ int sched_domain_level_max;
+ 
++#ifndef CONFIG_SCHED_ALT
+ static int __init setup_relax_domain_level(char *str)
+ {
+ 	if (kstrtoint(str, 0, &default_relax_domain_level))
+@@ -2027,6 +2030,7 @@ sd_init(struct sched_domain_topology_level *tl,
+ 
+ 	return sd;
+ }
++#endif /* CONFIG_SCHED_ALT */
+ 
+ #ifdef CONFIG_SCHED_SMT
+ int cpu_smt_flags(void)
+@@ -2118,6 +2122,7 @@ void __init set_sched_topology(struct sched_domain_topology_level *tl)
+ 	sched_domain_topology_saved = NULL;
+ }
+ 
++#ifndef CONFIG_SCHED_ALT
+ #ifdef CONFIG_NUMA
+ static int cpu_numa_flags(void)
+ {
+@@ -3502,3 +3507,31 @@ void partition_sched_domains(int ndoms_new, cpumask_var_t doms_new[],
+ 	partition_sched_domains_locked(ndoms_new, doms_new, dattr_new);
+ 	sched_domains_mutex_unlock();
+ }
++#else /* CONFIG_SCHED_ALT */
++DEFINE_STATIC_KEY_FALSE(sched_asym_cpucapacity);
++
++void partition_sched_domains(int ndoms_new, cpumask_var_t doms_new[],
++			     struct sched_domain_attr *dattr_new)
++{}
++
++#ifdef CONFIG_NUMA
++int sched_numa_find_closest(const struct cpumask *cpus, int cpu)
++{
++	return best_mask_cpu(cpu, cpus);
++}
++
++int sched_numa_find_nth_cpu(const struct cpumask *cpus, int cpu, int node)
++{
++	return cpumask_nth(cpu, cpus);
++}
++
++const struct cpumask *sched_numa_hop_mask(unsigned int node, unsigned int hops)
++{
++	return ERR_PTR(-EOPNOTSUPP);
++}
++EXPORT_SYMBOL_GPL(sched_numa_hop_mask);
++#endif /* CONFIG_NUMA */
++
++void sched_update_asym_prefer_cpu(int cpu, int old_prio, int new_prio)
++{}
++#endif
