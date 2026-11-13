@@ -1,0 +1,173 @@
+From: yanghaoming <yanghaoming@kaihong.com>
+To: io-uring@vger.kernel.org
+Cc: axboe@kernel.dk,
+	syzbot+9f32706bfd7c4ff81434@syzkaller.appspotmail.com
+Subject: [PATCH] io_uring/sqpoll: make io_sq_thread_stop() idempotent
+ IO_SQ_THREAD_SHOULD_STOP may already be set when io_sq_thread() exits on its
+ own. The last ring still calls io_sq_thread_stop() from io_put_sq_data(),
+ which tripped WARN_ON_ONCE(). Reproduced on 7.4-rc1 with IORING_SETUP_SQPOLL
+ + close(ring_fd),
+ which triggered WARNING at io_uring/sqpoll.c:88 before this patch. With this
+ patch applied,
+ the same repro no longer warns (also verified via QEMU initramfs repro).
+ Fixes: 22d9db9fd64a ("io_uring/sqpoll: don't attach to a thread that is
+ canceling") Reported-by:
+ syzbot+9f32706bfd7c4ff81434@syzkaller.appspotmail.com Link:
+ https://syzbot.org/bug?extid=9f32706bfd7c4ff81434 Tested-by: yanghaoming
+ <yanghaoming@kaihong.com>
+Date: Thu,  5 Nov 2026 16:33:54 +0800
+
+Signed-off-by: yanghaoming <yanghaoming@kaihong.com>
+---
+ io_uring/sqpoll.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/io_uring/sqpoll.c b/io_uring/sqpoll.c
+index c833e776320d..f0c9e07c2d04 100644
+--- a/io_uring/sqpoll.c
++++ b/io_uring/sqpoll.c
+@@ -80,14 +80,17 @@ static void io_sq_data_release(struct io_sq_data *sqd)
+  * ctx_list by now and have no request left, so the thread can reach none of
+  * them. What it still uses is its own or counted: the sqd by free_refs, the
+  * hash of its io-wq by hash->refs.
++ *
++ * IO_SQ_THREAD_SHOULD_STOP may already be set if io_sq_thread() is exiting on
++ * its own; only wake a thread that is still running.
+  */
+ void io_sq_thread_stop(struct io_sq_data *sqd)
+ {
+ 	struct task_struct *tsk;
+ 
+-	WARN_ON_ONCE(test_bit(IO_SQ_THREAD_SHOULD_STOP, &sqd->state));
++	if (test_and_set_bit(IO_SQ_THREAD_SHOULD_STOP, &sqd->state))
++		return;
+ 
+-	set_bit(IO_SQ_THREAD_SHOULD_STOP, &sqd->state);
+ 	mutex_lock(&sqd->lock);
+ 	tsk = sqpoll_task_locked(sqd);
+ 	if (tsk) {
+From: Henry Martin <bsdhenrymartin@gmail.com>
+To: axboe@kernel.dk
+Cc: io-uring@vger.kernel.org,
+	stable@vger.kernel.org,
+	Henry Martin <bsdhenrymartin@gmail.com>
+Subject: [PATCH] io_uring/kbuf: fix cross-mm interpretation of provided
+ buffers
+Date: Thu,  5 Nov 2026 14:14:33 +0800
+Message-ID: <20261105061433.1947491-1-bsdhenrymartin@gmail.com>
+
+Legacy provided buffers store a raw user virtual address.  It is
+recorded in io_add_buffers() and later returned verbatim by
+io_provided_buffer_select().  The consumer (recv, send, read)
+imports it as a user pointer, so it is resolved in the address
+space of whichever task issues the request.  Nothing ties a buffer
+to the address space it was provided from.
+
+When a ring is shared between tasks with different address spaces,
+for example across fork(2) and execve(2), a consuming request reads
+from or writes to an address chosen by the provider, in the
+consumer's address space.
+
+Record the providing task's mm in each buffer, and refuse selection
+when the consuming task runs under a different mm.  The buffer stays
+queued for its owner and the request fails with -ENOBUFS.  The mm
+reference is held while the buffer is queued.
+
+This issue was discovered by Tencent CodeBuddy Security.
+
+Reported-by: zeroday zhao <zerodayzhao@tencent.com>
+Fixes: ddf0322db79c5 ("io_uring: add IORING_OP_PROVIDE_BUFFERS")
+Cc: stable@vger.kernel.org
+Signed-off-by: Henry Martin <bsdhenrymartin@gmail.com>
+---
+ io_uring/kbuf.c | 23 ++++++++++++++++++++---
+ io_uring/kbuf.h |  2 ++
+ 2 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/io_uring/kbuf.c b/io_uring/kbuf.c
+index abf44f5dba26a..b585105a17202 100644
+--- a/io_uring/kbuf.c
++++ b/io_uring/kbuf.c
+@@ -4,6 +4,7 @@
+ #include <linux/fs.h>
+ #include <linux/file.h>
+ #include <linux/mm.h>
++#include <linux/sched/mm.h>
+ #include <linux/slab.h>
+ #include <linux/namei.h>
+ #include <linux/poll.h>
+@@ -97,12 +98,18 @@ static int io_buffer_add_list(struct io_ring_ctx *ctx,
+ 	return xa_err(xa_store(&ctx->io_bl_xa, bgid, bl, GFP_KERNEL));
+ }
+ 
++static void io_kbuf_free(struct io_buffer *buf)
++{
++	mmdrop(buf->mm);
++	kfree(buf);
++}
++
+ void io_kbuf_drop_legacy(struct io_kiocb *req)
+ {
+ 	if (WARN_ON_ONCE(!(req->flags & REQ_F_BUFFER_SELECTED)))
+ 		return;
+ 	req->flags &= ~REQ_F_BUFFER_SELECTED;
+-	kfree(req->kbuf);
++	io_kbuf_free(req->kbuf);
+ 	req->kbuf = NULL;
+ }
+ 
+@@ -124,7 +131,7 @@ bool io_kbuf_recycle_legacy(struct io_kiocb *req, unsigned issue_flags)
+ 		list_add(&buf->list, &bl->buf_list);
+ 		bl->nbufs++;
+ 	} else {
+-		kfree(buf);
++		io_kbuf_free(buf);
+ 	}
+ 	req->flags &= ~REQ_F_BUFFER_SELECTED;
+ 	req->kbuf = NULL;
+@@ -140,6 +147,14 @@ static void __user *io_provided_buffer_select(struct io_kiocb *req, size_t *len,
+ 		struct io_buffer *kbuf;
+ 
+ 		kbuf = list_first_entry(&bl->buf_list, struct io_buffer, list);
++		/*
++		 * The buffer address is a user virtual address that gets
++		 * interpreted in the address space of whoever issues the
++		 * request. Refuse consumption by a different mm than the
++		 * one that provided the buffer.
++		 */
++		if (unlikely(kbuf->mm != current->mm))
++			return NULL;
+ 		list_del(&kbuf->list);
+ 		bl->nbufs--;
+ 		if (*len == 0 || *len > kbuf->len)
+@@ -452,7 +467,7 @@ static int io_remove_buffers_legacy(struct io_ring_ctx *ctx,
+ 		nxt = list_first_entry(&bl->buf_list, struct io_buffer, list);
+ 		list_del(&nxt->list);
+ 		bl->nbufs--;
+-		kfree(nxt);
++		io_kbuf_free(nxt);
+ 		cond_resched();
+ 	}
+ 	return i;
+@@ -575,6 +590,8 @@ static int io_add_buffers(struct io_ring_ctx *ctx, struct io_provide_buf *pbuf,
+ 		buf->len = min_t(__u32, pbuf->len, MAX_RW_COUNT);
+ 		buf->bid = bid;
+ 		buf->bgid = pbuf->bgid;
++		buf->mm = current->mm;
++		mmgrab(buf->mm);
+ 		addr += pbuf->len;
+ 		bid++;
+ 		cond_resched();
+diff --git a/io_uring/kbuf.h b/io_uring/kbuf.h
+index 401773e1ef805..fe0b01c475a49 100644
+--- a/io_uring/kbuf.h
++++ b/io_uring/kbuf.h
+@@ -44,6 +44,8 @@ struct io_buffer_list {
+ 
+ struct io_buffer {
+ 	struct list_head list;
++	/* mm of the task that provided this buffer, see io_add_buffers() */
++	struct mm_struct *mm;
+ 	__u64 addr;
+ 	__u32 len;
+ 	__u16 bid;
