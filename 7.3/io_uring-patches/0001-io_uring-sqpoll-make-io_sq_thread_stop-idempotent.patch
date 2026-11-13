@@ -1,0 +1,48 @@
+From: yanghaoming <yanghaoming@kaihong.com>
+To: io-uring@vger.kernel.org
+Cc: axboe@kernel.dk,
+	syzbot+9f32706bfd7c4ff81434@syzkaller.appspotmail.com
+Subject: [PATCH] io_uring/sqpoll: make io_sq_thread_stop() idempotent
+ IO_SQ_THREAD_SHOULD_STOP may already be set when io_sq_thread() exits on its
+ own. The last ring still calls io_sq_thread_stop() from io_put_sq_data(),
+ which tripped WARN_ON_ONCE(). Reproduced on 7.4-rc1 with IORING_SETUP_SQPOLL
+ + close(ring_fd),
+ which triggered WARNING at io_uring/sqpoll.c:88 before this patch. With this
+ patch applied,
+ the same repro no longer warns (also verified via QEMU initramfs repro).
+ Fixes: 22d9db9fd64a ("io_uring/sqpoll: don't attach to a thread that is
+ canceling") Reported-by:
+ syzbot+9f32706bfd7c4ff81434@syzkaller.appspotmail.com Link:
+ https://syzbot.org/bug?extid=9f32706bfd7c4ff81434 Tested-by: yanghaoming
+ <yanghaoming@kaihong.com>
+Date: Thu,  5 Nov 2026 16:33:54 +0800
+
+Signed-off-by: yanghaoming <yanghaoming@kaihong.com>
+---
+ io_uring/sqpoll.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/io_uring/sqpoll.c b/io_uring/sqpoll.c
+index c833e776320d..f0c9e07c2d04 100644
+--- a/io_uring/sqpoll.c
++++ b/io_uring/sqpoll.c
+@@ -80,14 +80,17 @@ static void io_sq_data_release(struct io_sq_data *sqd)
+  * ctx_list by now and have no request left, so the thread can reach none of
+  * them. What it still uses is its own or counted: the sqd by free_refs, the
+  * hash of its io-wq by hash->refs.
++ *
++ * IO_SQ_THREAD_SHOULD_STOP may already be set if io_sq_thread() is exiting on
++ * its own; only wake a thread that is still running.
+  */
+ void io_sq_thread_stop(struct io_sq_data *sqd)
+ {
+ 	struct task_struct *tsk;
+ 
+-	WARN_ON_ONCE(test_bit(IO_SQ_THREAD_SHOULD_STOP, &sqd->state));
++	if (test_and_set_bit(IO_SQ_THREAD_SHOULD_STOP, &sqd->state))
++		return;
+ 
+-	set_bit(IO_SQ_THREAD_SHOULD_STOP, &sqd->state);
+ 	mutex_lock(&sqd->lock);
+ 	tsk = sqpoll_task_locked(sqd);
+ 	if (tsk) {
